@@ -7,6 +7,8 @@ job "mockhttp-vip" {
       cni {
         args = {
           containerIP = "10.0.11.45"
+          community   = "65001:100"
+          local_pref  = "200"
         }
       }
       port "http" { to = 3000 }

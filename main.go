@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -20,6 +23,7 @@ type NetConf struct {
 	types.NetConf
 	ContainerIP string `json:"containerIP"`
 	GWIP        string `json:"gwIP"`
+	Gocast      string `json:"gocast"` // e.g. http://localhost:8080
 	// If empty, defaults to /32 for both (works across host/container subnets)
 	Prefix      int    `json:"prefix"`
 }
@@ -160,12 +164,28 @@ func cmdAdd(args *skel.CmdArgs) error {
 			{Address: *contIPNet.IPNet, Interface: &idx},
 		},
 	}
+
+	// announce to gocast (any extra args like community are forwarded)
+	extra := parseExtraArgs(args.Args)
+	notifyGocast(conf.Gocast, "announce", conf.ContainerIP+"/32", extra)
+
 	return types.PrintResult(res, conf.CNIVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
 	conf := &NetConf{}
 	json.Unmarshal(args.StdinData, conf)
+	// support containerIP coming from cni.args on del too
+	if conf.ContainerIP == "" {
+		for _, kv := range strings.Split(args.Args, ";") {
+			if v, ok := strings.CutPrefix(kv, "containerIP="); ok {
+				conf.ContainerIP = v
+			}
+			if v, ok := strings.CutPrefix(kv, "IP="); ok {
+				conf.ContainerIP = v
+			}
+		}
+	}
 	pfx := conf.Prefix
 	if pfx == 0 {
 		pfx = 32
@@ -186,9 +206,45 @@ func cmdDel(args *skel.CmdArgs) error {
 		}
 		netlink.LinkDel(hostLink)
 	}
+
+	// withdraw from gocast
+	extra := parseExtraArgs(args.Args)
+	notifyGocast(conf.Gocast, "withdraw", conf.ContainerIP+"/32", extra)
+
 	return nil
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
 	return nil
+}
+
+// notifyGocast tells gocast (on localhost) to announce/withdraw the /32.
+// Any extra key=value from cni.args (e.g. community) are forwarded.
+func notifyGocast(gocastURL, action, prefix string, extra map[string]string) {
+	if gocastURL == "" {
+		return
+	}
+	payload := map[string]any{
+		"action": action,
+		"prefix": prefix,
+	}
+	for k, v := range extra {
+		payload[k] = v
+	}
+	body, _ := json.Marshal(payload)
+	client := &http.Client{Timeout: 2 * time.Second}
+	_, _ = client.Post(gocastURL, "application/json", bytes.NewReader(body))
+}
+
+func parseExtraArgs(s string) map[string]string {
+	m := map[string]string{}
+	for _, kv := range strings.Split(s, ";") {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			k = strings.ToLower(strings.TrimSpace(k))
+			if k != "containerip" && k != "ip" && k != "gwip" {
+				m[k] = strings.TrimSpace(v)
+			}
+		}
+	}
+	return m
 }

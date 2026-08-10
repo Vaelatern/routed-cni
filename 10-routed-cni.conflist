@@ -5,6 +5,7 @@
     {
       "type": "routed-cni",
       "gwIP": "10.0.10.10",
+      "gocast": "http://localhost:8080",
       "prefix": 32
     }
   ]
