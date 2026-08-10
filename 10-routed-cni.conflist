@@ -1,0 +1,11 @@
+{
+  "cniVersion": "1.0.0",
+  "name": "routed-cni",
+  "plugins": [
+    {
+      "type": "routed-cni",
+      "gwIP": "10.0.10.10",
+      "prefix": 32
+    }
+  ]
+}
