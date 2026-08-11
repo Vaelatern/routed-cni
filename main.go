@@ -220,10 +220,21 @@ func cmdCheck(args *skel.CmdArgs) error {
 
 // notifyGocast tells gocast (on localhost) to announce/withdraw the /32.
 // Any extra key=value from cni.args (e.g. community) are forwarded.
+// If gocastURL == "service:nomad", it discovers the local gocast via Nomad API.
 func notifyGocast(gocastURL, action, prefix string, extra map[string]string) {
 	if gocastURL == "" {
 		return
 	}
+
+	url := gocastURL
+	if gocastURL == "service:nomad" {
+		var err error
+		url, err = resolveLocalGocast()
+		if err != nil {
+			return
+		}
+	}
+
 	payload := map[string]any{
 		"action": action,
 		"prefix": prefix,
@@ -233,7 +244,7 @@ func notifyGocast(gocastURL, action, prefix string, extra map[string]string) {
 	}
 	body, _ := json.Marshal(payload)
 	client := &http.Client{Timeout: 2 * time.Second}
-	_, _ = client.Post(gocastURL, "application/json", bytes.NewReader(body))
+	_, _ = client.Post(url, "application/json", bytes.NewReader(body))
 }
 
 func parseExtraArgs(s string) map[string]string {
@@ -247,4 +258,69 @@ func parseExtraArgs(s string) map[string]string {
 		}
 	}
 	return m
+}
+
+// resolveLocalGocast queries the local Nomad agent for a "gocast" service
+// running on the same IP as this host.
+func resolveLocalGocast() (string, error) {
+	hostIP := getHostIP()
+	if hostIP == "" {
+		return "", fmt.Errorf("could not determine host IP")
+	}
+
+	nomadAddr := os.Getenv("NOMAD_ADDR")
+	if nomadAddr == "" {
+		nomadAddr = "http://127.0.0.1:4646"
+	}
+
+	url := fmt.Sprintf("%s/v1/service/gocast", nomadAddr)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	if token := os.Getenv("NOMAD_TOKEN"); token != "" {
+		req.Header.Set("X-Nomad-Token", token)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var services []struct {
+		Address string `json:"Address"`
+		Port    int    `json:"Port"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&services); err != nil {
+		return "", err
+	}
+
+	for _, svc := range services {
+		if svc.Address == hostIP && svc.Port != 0 {
+			return fmt.Sprintf("http://%s:%d", hostIP, svc.Port), nil
+		}
+	}
+	return "", fmt.Errorf("no local gocast service found on %s", hostIP)
+}
+
+// getHostIP returns the primary non-loopback IPv4 address of the host.
+func getHostIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return ""
 }
