@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -19,13 +21,21 @@ import (
 	"github.com/vishvananda/netns"
 )
 
+type NomadTLS struct {
+	CAFile   string `json:"caFile"`
+	CertFile string `json:"certFile"`
+	KeyFile  string `json:"keyFile"`
+	Insecure bool   `json:"insecure"` // skip TLS verify
+}
+
 type NetConf struct {
 	types.NetConf
-	ContainerIP    string `json:"containerIP"`
-	GWIP           string `json:"gwIP"`
-	Gocast         string `json:"gocast"`         // http://... or "service:nomad"
-	NomadAddr      string `json:"nomadAddr"`      // Nomad address if not http://localhost:4646
-	NomadTokenFile string `json:"nomadTokenFile"` // path to scoped token (preferred)
+	ContainerIP    string    `json:"containerIP"`
+	GWIP           string    `json:"gwIP"`
+	Gocast         string    `json:"gocast"`         // http://... or "service:nomad"
+	NomadAddr      string    `json:"nomadAddr"`      // default http://127.0.0.1:4646
+	NomadTokenFile string    `json:"nomadTokenFile"` // empty = no token
+	NomadTLS       *NomadTLS `json:"nomadTls"`       // optional TLS for Nomad API
 	// If empty, defaults to /32 for both (works across host/container subnets)
 	Prefix int `json:"prefix"`
 }
@@ -276,30 +286,40 @@ func parseExtraArgs(s string) map[string]string {
 
 // resolveLocalService queries the local Nomad agent for serviceName
 // running on the same IP as this host.
-// Token order: nomadTokenFile (CNI config) → NOMAD_TOKEN env.
-func resolveLocalService(serviceName, conf *NetConf) (string, error) {
+// nomadAddr default: http://127.0.0.1:4646. Token: nomadTokenFile only (empty = none).
+func resolveLocalService(serviceName string, conf *NetConf) (string, error) {
 	hostIP := getHostIP()
 	if hostIP == "" {
 		return "", fmt.Errorf("could not determine host IP")
 	}
 
-	nomadAddr := os.Getenv("NOMAD_ADDR")
+	nomadAddr := conf.NomadAddr
 	if nomadAddr == "" {
 		nomadAddr = "http://127.0.0.1:4646"
 	}
 
-	url := fmt.Sprintf("%s/v1/service/%s", nomadAddr, serviceName)
+	url := fmt.Sprintf("%s/v1/service/%s", strings.TrimRight(nomadAddr, "/"), serviceName)
 
-	req, _ := http.NewRequest("GET", url, nil)
-	if token := loadNomadToken(tokenFile); token != "" {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	if token := loadNomadToken(conf.NomadTokenFile); token != "" {
 		req.Header.Set("X-Nomad-Token", token)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	client, err := nomadHTTPClient(conf)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("nomad %s: %s", url, resp.Status)
+	}
 
 	var services []struct {
 		Address string `json:"Address"`
@@ -317,17 +337,44 @@ func resolveLocalService(serviceName, conf *NetConf) (string, error) {
 	return "", fmt.Errorf("no local %s service found on %s", serviceName, hostIP)
 }
 
-// loadNomadToken prefers the CNI-configured file (scoped client token),
-// then falls back to NOMAD_TOKEN env for ad-hoc use.
 func loadNomadToken(tokenFile string) string {
-	if tokenFile != "" {
-		if b, err := os.ReadFile(tokenFile); err == nil {
-			if t := strings.TrimSpace(string(b)); t != "" {
-				return t
-			}
-		}
+	if tokenFile == "" {
+		return ""
 	}
-	return os.Getenv("NOMAD_TOKEN")
+	b, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// nomadHTTPClient builds a client with optional TLS from conf.nomadTls.
+func nomadHTTPClient(conf *NetConf) (*http.Client, error) {
+	c := &http.Client{Timeout: 2 * time.Second}
+	if conf == nil || conf.NomadTLS == nil {
+		return c, nil
+	}
+	tlsCfg := &tls.Config{InsecureSkipVerify: conf.NomadTLS.Insecure}
+	if conf.NomadTLS.CAFile != "" {
+		b, err := os.ReadFile(conf.NomadTLS.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("nomadTls.caFile: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(b) {
+			return nil, fmt.Errorf("nomadTls.caFile: no certs")
+		}
+		tlsCfg.RootCAs = pool
+	}
+	if conf.NomadTLS.CertFile != "" || conf.NomadTLS.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(conf.NomadTLS.CertFile, conf.NomadTLS.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("nomadTls client cert: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+	c.Transport = &http.Transport{TLSClientConfig: tlsCfg}
+	return c, nil
 }
 
 // getHostIP returns the primary non-loopback IPv4 address of the host.
