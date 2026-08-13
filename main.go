@@ -21,11 +21,13 @@ import (
 
 type NetConf struct {
 	types.NetConf
-	ContainerIP string `json:"containerIP"`
-	GWIP        string `json:"gwIP"`
-	Gocast      string `json:"gocast"` // e.g. http://localhost:8080
+	ContainerIP    string `json:"containerIP"`
+	GWIP           string `json:"gwIP"`
+	Gocast         string `json:"gocast"`         // http://... or "service:nomad"
+	NomadAddr      string `json:"nomadAddr"`      // Nomad address if not http://localhost:4646
+	NomadTokenFile string `json:"nomadTokenFile"` // path to scoped token (preferred)
 	// If empty, defaults to /32 for both (works across host/container subnets)
-	Prefix      int    `json:"prefix"`
+	Prefix int `json:"prefix"`
 }
 
 func main() {
@@ -167,7 +169,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	// announce to gocast (any extra args like community are forwarded)
 	extra := parseExtraArgs(args.Args)
-	notifyGocast(conf.Gocast, "announce", conf.ContainerIP+"/32", extra)
+	notifyGocast(conf, "announce", conf.ContainerIP+"/32", extra)
 
 	return types.PrintResult(res, conf.CNIVersion)
 }
@@ -209,7 +211,7 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	// withdraw from gocast
 	extra := parseExtraArgs(args.Args)
-	notifyGocast(conf.Gocast, "withdraw", conf.ContainerIP+"/32", extra)
+	notifyGocast(conf, "withdraw", conf.ContainerIP+"/32", extra)
 
 	return nil
 }
@@ -221,15 +223,15 @@ func cmdCheck(args *skel.CmdArgs) error {
 // notifyGocast tells gocast (on localhost) to announce/withdraw the /32.
 // Any extra key=value from cni.args (e.g. community) are forwarded.
 // Magic: "service:nomad" or "service:nomad:service:NAME" → resolve via Nomad API.
-func notifyGocast(gocastURL, action, prefix string, extra map[string]string) {
-	if gocastURL == "" {
+func notifyGocast(conf *NetConf, action, prefix string, extra map[string]string) {
+	if conf == nil || conf.Gocast == "" {
 		return
 	}
 
-	url := gocastURL
-	if name, ok := parseNomadService(gocastURL); ok {
+	url := conf.Gocast
+	if name, ok := parseNomadService(conf.Gocast); ok {
 		var err error
-		url, err = resolveLocalService(name)
+		url, err = resolveLocalService(name, conf)
 		if err != nil {
 			return
 		}
@@ -274,7 +276,8 @@ func parseExtraArgs(s string) map[string]string {
 
 // resolveLocalService queries the local Nomad agent for serviceName
 // running on the same IP as this host.
-func resolveLocalService(serviceName string) (string, error) {
+// Token order: nomadTokenFile (CNI config) → NOMAD_TOKEN env.
+func resolveLocalService(serviceName, conf *NetConf) (string, error) {
 	hostIP := getHostIP()
 	if hostIP == "" {
 		return "", fmt.Errorf("could not determine host IP")
@@ -288,7 +291,7 @@ func resolveLocalService(serviceName string) (string, error) {
 	url := fmt.Sprintf("%s/v1/service/%s", nomadAddr, serviceName)
 
 	req, _ := http.NewRequest("GET", url, nil)
-	if token := os.Getenv("NOMAD_TOKEN"); token != "" {
+	if token := loadNomadToken(tokenFile); token != "" {
 		req.Header.Set("X-Nomad-Token", token)
 	}
 
@@ -312,6 +315,19 @@ func resolveLocalService(serviceName string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no local %s service found on %s", serviceName, hostIP)
+}
+
+// loadNomadToken prefers the CNI-configured file (scoped client token),
+// then falls back to NOMAD_TOKEN env for ad-hoc use.
+func loadNomadToken(tokenFile string) string {
+	if tokenFile != "" {
+		if b, err := os.ReadFile(tokenFile); err == nil {
+			if t := strings.TrimSpace(string(b)); t != "" {
+				return t
+			}
+		}
+	}
+	return os.Getenv("NOMAD_TOKEN")
 }
 
 // getHostIP returns the primary non-loopback IPv4 address of the host.
