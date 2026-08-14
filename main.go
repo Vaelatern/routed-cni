@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -230,21 +231,34 @@ func cmdCheck(args *skel.CmdArgs) error {
 	return nil
 }
 
+func init() {
+	// CNI result is on stdout; diagnostics go to stderr (Nomad agent log).
+	log.SetOutput(os.Stderr)
+	log.SetPrefix("routed-cni: ")
+	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
+}
+
 // notifyGocast tells gocast (on localhost) to announce/withdraw the /32.
 // Any extra key=value from cni.args (e.g. community) are forwarded.
 // Magic: "service:nomad" or "service:nomad:service:NAME" → resolve via Nomad API.
 func notifyGocast(conf *NetConf, action, prefix string, extra map[string]string) {
 	if conf == nil || conf.Gocast == "" {
+		log.Printf("gocast: skip (no conf/gocast) action=%s prefix=%s", action, prefix)
 		return
 	}
 
 	url := conf.Gocast
 	if name, ok := parseNomadService(conf.Gocast); ok {
+		log.Printf("nomad: resolve service=%s addr=%q tokenFile=%q tls=%v", name, conf.NomadAddr, conf.NomadTokenFile, conf.NomadTLS != nil)
 		var err error
 		url, err = resolveLocalService(name, conf)
 		if err != nil {
+			log.Printf("nomad: resolve FAILED: %v", err)
 			return
 		}
+		log.Printf("nomad: resolve ok → %s", url)
+	} else {
+		log.Printf("gocast: static url=%s", url)
 	}
 
 	payload := map[string]any{
@@ -256,7 +270,13 @@ func notifyGocast(conf *NetConf, action, prefix string, extra map[string]string)
 	}
 	body, _ := json.Marshal(payload)
 	client := &http.Client{Timeout: 2 * time.Second}
-	_, _ = client.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("gocast: POST %s FAILED: %v", url, err)
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("gocast: POST %s action=%s prefix=%s → %s", url, action, prefix, resp.Status)
 }
 
 // parseNomadService accepts "service:nomad" (default name gocast)
@@ -304,21 +324,23 @@ func resolveLocalService(serviceName string, conf *NetConf) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if token := loadNomadToken(conf.NomadTokenFile); token != "" {
+	token := loadNomadToken(conf.NomadTokenFile)
+	if token != "" {
 		req.Header.Set("X-Nomad-Token", token)
 	}
+	log.Printf("nomad: GET %s token=%v hostIP=%s", url, token != "", hostIP)
 
 	client, err := nomadHTTPClient(conf)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("tls client: %w", err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("nomad %s: %s", url, resp.Status)
+		return "", fmt.Errorf("GET %s: %s (auth/tls/acl?)", url, resp.Status)
 	}
 
 	var services []struct {
@@ -329,12 +351,14 @@ func resolveLocalService(serviceName string, conf *NetConf) (string, error) {
 		return "", err
 	}
 
+	log.Printf("nomad: %d registration(s) for %s", len(services), serviceName)
 	for _, svc := range services {
+		log.Printf("nomad: candidate Address=%s Port=%d matchHost=%v", svc.Address, svc.Port, svc.Address == hostIP)
 		if svc.Address == hostIP && svc.Port != 0 {
 			return fmt.Sprintf("http://%s:%d", hostIP, svc.Port), nil
 		}
 	}
-	return "", fmt.Errorf("no local %s service found on %s", serviceName, hostIP)
+	return "", fmt.Errorf("no local %s service found on %s (%d candidates)", serviceName, hostIP, len(services))
 }
 
 func loadNomadToken(tokenFile string) string {
@@ -354,6 +378,8 @@ func nomadHTTPClient(conf *NetConf) (*http.Client, error) {
 	if conf == nil || conf.NomadTLS == nil {
 		return c, nil
 	}
+	log.Printf("nomad: tls ca=%q cert=%q key=%q insecure=%v",
+		conf.NomadTLS.CAFile, conf.NomadTLS.CertFile, conf.NomadTLS.KeyFile, conf.NomadTLS.Insecure)
 	tlsCfg := &tls.Config{InsecureSkipVerify: conf.NomadTLS.Insecure}
 	if conf.NomadTLS.CAFile != "" {
 		b, err := os.ReadFile(conf.NomadTLS.CAFile)
