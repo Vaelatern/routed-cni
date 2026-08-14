@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -9,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -238,8 +238,9 @@ func init() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 }
 
-// notifyGocast tells gocast (on localhost) to announce/withdraw the /32.
-// Any extra key=value from cni.args (e.g. community) are forwarded.
+// notifyGocast tells gocast to register/unregister a VIP.
+// Real API: GET /register?name=&vip=&vip_communities=&monitor=&nat=
+//           GET /unregister?name=
 // Magic: "service:nomad" or "service:nomad:service:NAME" → resolve via Nomad API.
 func notifyGocast(conf *NetConf, action, prefix string, extra map[string]string) {
 	if conf == nil || conf.Gocast == "" {
@@ -247,36 +248,75 @@ func notifyGocast(conf *NetConf, action, prefix string, extra map[string]string)
 		return
 	}
 
-	url := conf.Gocast
-	if name, ok := parseNomadService(conf.Gocast); ok {
-		log.Printf("nomad: resolve service=%s addr=%q tokenFile=%q tls=%v", name, conf.NomadAddr, conf.NomadTokenFile, conf.NomadTLS != nil)
+	base := conf.Gocast
+	if svc, ok := parseNomadService(conf.Gocast); ok {
+		log.Printf("nomad: resolve service=%s addr=%q tokenFile=%q tls=%v", svc, conf.NomadAddr, conf.NomadTokenFile, conf.NomadTLS != nil)
 		var err error
-		url, err = resolveLocalService(name, conf)
+		base, err = resolveLocalService(svc, conf)
 		if err != nil {
 			log.Printf("nomad: resolve FAILED: %v", err)
 			return
 		}
-		log.Printf("nomad: resolve ok → %s", url)
+		log.Printf("nomad: resolve ok → %s", base)
 	} else {
-		log.Printf("gocast: static url=%s", url)
+		log.Printf("gocast: static url=%s", base)
 	}
 
-	payload := map[string]any{
-		"action": action,
-		"prefix": prefix,
-	}
-	for k, v := range extra {
-		payload[k] = v
-	}
-	body, _ := json.Marshal(payload)
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	reqURL, err := gocastURL(base, action, prefix, extra)
 	if err != nil {
-		log.Printf("gocast: POST %s FAILED: %v", url, err)
+		log.Printf("gocast: bad url: %v", err)
+		return
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(reqURL)
+	if err != nil {
+		log.Printf("gocast: GET %s FAILED: %v", reqURL, err)
 		return
 	}
 	defer resp.Body.Close()
-	log.Printf("gocast: POST %s action=%s prefix=%s → %s", url, action, prefix, resp.Status)
+	log.Printf("gocast: GET %s → %s", reqURL, resp.Status)
+}
+
+// gocastURL builds GET /register or /unregister matching gocast's real HTTP API.
+func gocastURL(base, action, prefix string, extra map[string]string) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	name := extra["name"]
+	if name == "" {
+		name = strings.SplitN(prefix, "/", 2)[0]
+	}
+	q := url.Values{}
+	q.Set("name", name)
+	switch action {
+	case "announce":
+		u.Path = strings.TrimRight(u.Path, "/") + "/register"
+		q.Set("vip", prefix)
+		c := extra["vip_communities"]
+		if c == "" {
+			c = extra["community"]
+		}
+		if c != "" {
+			q.Set("vip_communities", c)
+		}
+		for _, mon := range strings.Split(extra["monitor"], ",") {
+			if mon = strings.TrimSpace(mon); mon != "" {
+				q.Add("monitor", mon)
+			}
+		}
+		for _, nat := range strings.Split(extra["nat"], ",") {
+			if nat = strings.TrimSpace(nat); nat != "" {
+				q.Add("nat", nat)
+			}
+		}
+	case "withdraw":
+		u.Path = strings.TrimRight(u.Path, "/") + "/unregister"
+	default:
+		return "", fmt.Errorf("unknown action %q", action)
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 // parseNomadService accepts "service:nomad" (default name gocast)

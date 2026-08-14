@@ -9,6 +9,27 @@ import (
 	"testing"
 )
 
+func TestGocastURL(t *testing.T) {
+	reg, err := gocastURL("http://10.0.0.1:9999", "announce", "10.0.11.33/32", map[string]string{
+		"name":      "mockhttp",
+		"community": "65534:2",
+		"monitor":   "port:tcp:3000",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reg != "http://10.0.0.1:9999/register?monitor=port%3Atcp%3A3000&name=mockhttp&vip=10.0.11.33%2F32&vip_communities=65534%3A2" {
+		t.Fatalf("register url=%q", reg)
+	}
+	unreg, err := gocastURL("http://10.0.0.1:9999/", "withdraw", "10.0.11.33/32", map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unreg != "http://10.0.0.1:9999/unregister?name=10.0.11.33" {
+		t.Fatalf("unregister url=%q", unreg)
+	}
+}
+
 func TestParseNomadService(t *testing.T) {
 	cases := []struct {
 		in       string
