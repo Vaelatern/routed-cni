@@ -1,18 +1,12 @@
 package main
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -22,21 +16,10 @@ import (
 	"github.com/vishvananda/netns"
 )
 
-type NomadTLS struct {
-	CAFile   string `json:"caFile"`
-	CertFile string `json:"certFile"`
-	KeyFile  string `json:"keyFile"`
-	Insecure bool   `json:"insecure"` // skip TLS verify
-}
-
 type NetConf struct {
 	types.NetConf
-	ContainerIP    string    `json:"containerIP"`
-	GWIP           string    `json:"gwIP"`
-	Gocast         string    `json:"gocast"`         // http://... or "service:nomad"
-	NomadAddr      string    `json:"nomadAddr"`      // default http://127.0.0.1:4646
-	NomadTokenFile string    `json:"nomadTokenFile"` // empty = no token
-	NomadTLS       *NomadTLS `json:"nomadTls"`       // optional TLS for Nomad API
+	ContainerIP string `json:"containerIP"`
+	GWIP        string `json:"gwIP"`
 	// If empty, defaults to /32 for both (works across host/container subnets)
 	Prefix int `json:"prefix"`
 }
@@ -166,7 +149,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("host route: %w", err)
 	}
 
-	// result
 	idx := 0
 	res := &current.Result{
 		CNIVersion: conf.CNIVersion,
@@ -177,18 +159,12 @@ func cmdAdd(args *skel.CmdArgs) error {
 			{Address: *contIPNet.IPNet, Interface: &idx},
 		},
 	}
-
-	// announce to gocast (any extra args like community are forwarded)
-	extra := parseExtraArgs(args.Args)
-	notifyGocast(conf, "announce", conf.ContainerIP+"/32", extra)
-
 	return types.PrintResult(res, conf.CNIVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
 	conf := &NetConf{}
 	json.Unmarshal(args.StdinData, conf)
-	// support containerIP coming from cni.args on del too
 	if conf.ContainerIP == "" {
 		for _, kv := range strings.Split(args.Args, ";") {
 			if v, ok := strings.CutPrefix(kv, "containerIP="); ok {
@@ -219,249 +195,9 @@ func cmdDel(args *skel.CmdArgs) error {
 		}
 		netlink.LinkDel(hostLink)
 	}
-
-	// withdraw from gocast
-	extra := parseExtraArgs(args.Args)
-	notifyGocast(conf, "withdraw", conf.ContainerIP+"/32", extra)
-
 	return nil
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
 	return nil
-}
-
-func init() {
-	// CNI result is on stdout; diagnostics go to stderr (Nomad agent log).
-	log.SetOutput(os.Stderr)
-	log.SetPrefix("routed-cni: ")
-	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-}
-
-// notifyGocast tells gocast to register/unregister a VIP.
-// Real API: GET /register?name=&vip=&vip_communities=&monitor=&nat=
-//           GET /unregister?name=
-// Magic: "service:nomad" or "service:nomad:service:NAME" → resolve via Nomad API.
-func notifyGocast(conf *NetConf, action, prefix string, extra map[string]string) {
-	if conf == nil || conf.Gocast == "" {
-		log.Printf("gocast: skip (no conf/gocast) action=%s prefix=%s", action, prefix)
-		return
-	}
-
-	base := conf.Gocast
-	if svc, ok := parseNomadService(conf.Gocast); ok {
-		log.Printf("nomad: resolve service=%s addr=%q tokenFile=%q tls=%v", svc, conf.NomadAddr, conf.NomadTokenFile, conf.NomadTLS != nil)
-		var err error
-		base, err = resolveLocalService(svc, conf)
-		if err != nil {
-			log.Printf("nomad: resolve FAILED: %v", err)
-			return
-		}
-		log.Printf("nomad: resolve ok → %s", base)
-	} else {
-		log.Printf("gocast: static url=%s", base)
-	}
-
-	reqURL, err := gocastURL(base, action, prefix, extra)
-	if err != nil {
-		log.Printf("gocast: bad url: %v", err)
-		return
-	}
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(reqURL)
-	if err != nil {
-		log.Printf("gocast: GET %s FAILED: %v", reqURL, err)
-		return
-	}
-	defer resp.Body.Close()
-	log.Printf("gocast: GET %s → %s", reqURL, resp.Status)
-}
-
-// gocastURL builds GET /register or /unregister matching gocast's real HTTP API.
-func gocastURL(base, action, prefix string, extra map[string]string) (string, error) {
-	u, err := url.Parse(base)
-	if err != nil {
-		return "", err
-	}
-	name := extra["name"]
-	if name == "" {
-		name = strings.SplitN(prefix, "/", 2)[0]
-	}
-	q := url.Values{}
-	q.Set("name", name)
-	switch action {
-	case "announce":
-		u.Path = strings.TrimRight(u.Path, "/") + "/register"
-		q.Set("vip", prefix)
-		c := extra["vip_communities"]
-		if c == "" {
-			c = extra["community"]
-		}
-		if c != "" {
-			q.Set("vip_communities", c)
-		}
-		for _, mon := range strings.Split(extra["monitor"], ",") {
-			if mon = strings.TrimSpace(mon); mon != "" {
-				q.Add("monitor", mon)
-			}
-		}
-		for _, nat := range strings.Split(extra["nat"], ",") {
-			if nat = strings.TrimSpace(nat); nat != "" {
-				q.Add("nat", nat)
-			}
-		}
-	case "withdraw":
-		u.Path = strings.TrimRight(u.Path, "/") + "/unregister"
-	default:
-		return "", fmt.Errorf("unknown action %q", action)
-	}
-	u.RawQuery = q.Encode()
-	return u.String(), nil
-}
-
-// parseNomadService accepts "service:nomad" (default name gocast)
-// or "service:nomad:service:NAME".
-func parseNomadService(s string) (name string, ok bool) {
-	if s == "service:nomad" {
-		return "gocast", true
-	}
-	if name, ok := strings.CutPrefix(s, "service:nomad:service:"); ok && name != "" {
-		return name, true
-	}
-	return "", false
-}
-
-func parseExtraArgs(s string) map[string]string {
-	m := map[string]string{}
-	for _, kv := range strings.Split(s, ";") {
-		if k, v, ok := strings.Cut(kv, "="); ok {
-			k = strings.ToLower(strings.TrimSpace(k))
-			if k != "containerip" && k != "ip" && k != "gwip" {
-				m[k] = strings.TrimSpace(v)
-			}
-		}
-	}
-	return m
-}
-
-// resolveLocalService queries the local Nomad agent for serviceName
-// running on the same IP as this host.
-// nomadAddr default: http://127.0.0.1:4646. Token: nomadTokenFile only (empty = none).
-func resolveLocalService(serviceName string, conf *NetConf) (string, error) {
-	hostIP := getHostIP()
-	if hostIP == "" {
-		return "", fmt.Errorf("could not determine host IP")
-	}
-
-	nomadAddr := conf.NomadAddr
-	if nomadAddr == "" {
-		nomadAddr = "http://127.0.0.1:4646"
-	}
-
-	url := fmt.Sprintf("%s/v1/service/%s", strings.TrimRight(nomadAddr, "/"), serviceName)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", err
-	}
-	token := loadNomadToken(conf.NomadTokenFile)
-	if token != "" {
-		req.Header.Set("X-Nomad-Token", token)
-	}
-	log.Printf("nomad: GET %s token=%v hostIP=%s", url, token != "", hostIP)
-
-	client, err := nomadHTTPClient(conf)
-	if err != nil {
-		return "", fmt.Errorf("tls client: %w", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("GET %s: %s (auth/tls/acl?)", url, resp.Status)
-	}
-
-	var services []struct {
-		Address string `json:"Address"`
-		Port    int    `json:"Port"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&services); err != nil {
-		return "", err
-	}
-
-	log.Printf("nomad: %d registration(s) for %s", len(services), serviceName)
-	for _, svc := range services {
-		log.Printf("nomad: candidate Address=%s Port=%d matchHost=%v", svc.Address, svc.Port, svc.Address == hostIP)
-		if svc.Address == hostIP && svc.Port != 0 {
-			return fmt.Sprintf("http://%s:%d", hostIP, svc.Port), nil
-		}
-	}
-	return "", fmt.Errorf("no local %s service found on %s (%d candidates)", serviceName, hostIP, len(services))
-}
-
-func loadNomadToken(tokenFile string) string {
-	if tokenFile == "" {
-		return ""
-	}
-	b, err := os.ReadFile(tokenFile)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(b))
-}
-
-// nomadHTTPClient builds a client with optional TLS from conf.nomadTls.
-func nomadHTTPClient(conf *NetConf) (*http.Client, error) {
-	c := &http.Client{Timeout: 2 * time.Second}
-	if conf == nil || conf.NomadTLS == nil {
-		return c, nil
-	}
-	log.Printf("nomad: tls ca=%q cert=%q key=%q insecure=%v",
-		conf.NomadTLS.CAFile, conf.NomadTLS.CertFile, conf.NomadTLS.KeyFile, conf.NomadTLS.Insecure)
-	tlsCfg := &tls.Config{InsecureSkipVerify: conf.NomadTLS.Insecure}
-	if conf.NomadTLS.CAFile != "" {
-		b, err := os.ReadFile(conf.NomadTLS.CAFile)
-		if err != nil {
-			return nil, fmt.Errorf("nomadTls.caFile: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(b) {
-			return nil, fmt.Errorf("nomadTls.caFile: no certs")
-		}
-		tlsCfg.RootCAs = pool
-	}
-	if conf.NomadTLS.CertFile != "" || conf.NomadTLS.KeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(conf.NomadTLS.CertFile, conf.NomadTLS.KeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("nomadTls client cert: %w", err)
-		}
-		tlsCfg.Certificates = []tls.Certificate{cert}
-	}
-	c.Transport = &http.Transport{TLSClientConfig: tlsCfg}
-	return c, nil
-}
-
-// getHostIP returns the primary non-loopback IPv4 address of the host.
-func getHostIP() string {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-				return ipnet.IP.String()
-			}
-		}
-	}
-	return ""
 }

@@ -27,7 +27,6 @@ job "cni-config-templater" {
     {
       "type": "routed-cni",
       "gwIP": "{{ $hostIP }}",
-      "gocast": "http://127.0.0.1:{{- range nomadService "gocast" }}{{ if eq .Address $hostIP }}{{ .Port }}{{ end }}{{ end }}",
       "prefix": 32
     }
   ]
