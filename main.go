@@ -69,6 +69,9 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 	netlink.LinkSetUp(hostLink)
+	if err := netlink.LinkSetAlias(hostLink, "healthcheck:ok"); err != nil {
+		return fmt.Errorf("set alias: %w", err)
+	}
 
 	// ensure sysctls (ip_forward once is enough; rp_filter=2 on veth for host IP reachability from container)
 	_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644)
