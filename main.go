@@ -120,6 +120,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		netns.Set(origNs)
 		return err
 	}
+	// Once in the namespace, we can do things like set the network name to eth0
 	if err := netlink.LinkSetName(l, "eth0"); err != nil {
 		netns.Set(origNs)
 		return err
