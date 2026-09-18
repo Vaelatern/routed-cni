@@ -12,6 +12,7 @@ import (
 	"github.com/containernetworking/cni/pkg/types"
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 )
@@ -152,6 +153,9 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err := netlink.RouteReplace(hostRt); err != nil {
 		return fmt.Errorf("host route: %w", err)
 	}
+	if err := setupForward(conf.ContainerIP); err != nil {
+		return fmt.Errorf("forward rules: %w", err)
+	}
 
 	idx := 0
 	res := &current.Result{
@@ -196,12 +200,71 @@ func cmdDel(args *skel.CmdArgs) error {
 				Dst:       &net.IPNet{IP: net.ParseIP(conf.ContainerIP), Mask: net.CIDRMask(pfx, pfx)},
 			}
 			netlink.RouteDel(hostRt)
+			teardownForward(conf.ContainerIP)
 		}
 		netlink.LinkDel(hostLink)
+	} else if conf.ContainerIP != "" {
+		teardownForward(conf.ContainerIP)
 	}
 	return nil
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
+	return nil
+}
+
+// full allow: routed /32 has no bridge iface for NOMAD-ADMIN-style -o matching
+func forwardRules(ip string) [][]string {
+	cidr := ip + "/32"
+	return [][]string{
+		{"-d", cidr, "-j", "ACCEPT"},
+		{"-s", cidr, "-j", "ACCEPT"},
+	}
+}
+
+func setupForward(ip string) error {
+	ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	if err != nil {
+		return err
+	}
+	if err := ensureCNIForward(ipt); err != nil {
+		return err
+	}
+	for _, r := range forwardRules(ip) {
+		if err := ipt.AppendUnique("filter", "CNI-FORWARD", r...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func teardownForward(ip string) {
+	ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	if err != nil {
+		return
+	}
+	for _, r := range forwardRules(ip) {
+		_ = ipt.Delete("filter", "CNI-FORWARD", r...)
+	}
+}
+
+func ensureCNIForward(ipt *iptables.IPTables) error {
+	ok, err := ipt.ChainExists("filter", "CNI-FORWARD")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		if err := ipt.NewChain("filter", "CNI-FORWARD"); err != nil {
+			return err
+		}
+	}
+	jump := []string{"-m", "comment", "--comment", "CNI firewall plugin rules", "-j", "CNI-FORWARD"}
+	ok, err = ipt.Exists("filter", "FORWARD", jump...)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ipt.Insert("filter", "FORWARD", 1, jump...)
+	}
 	return nil
 }
