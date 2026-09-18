@@ -11,14 +11,12 @@ job "mockhttp-vip" {
           local_pref  = "200"
         }
       }
-      port "http" { to = 3000 }
     }
 
     task "mockhttp" {
       driver = "docker"
       config {
         image = "docker.io/jaredwray/mockhttp"
-        ports = ["http"]
       }
 
       resources {
