@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -17,92 +19,154 @@ import (
 	"github.com/vishvananda/netns"
 )
 
+const (
+	defaultBridge     = "routedbr"
+	defaultBridgeCIDR = "172.27.64.0/20"
+	vipTable          = 101
+)
+
+// overridable for tests
+var dataDir = "/var/lib/cni/routed-cni"
+
 type NetConf struct {
 	types.NetConf
 	ContainerIP string `json:"containerIP"`
 	GWIP        string `json:"gwIP"`
-	// If empty, defaults to /32 for both (works across host/container subnets)
-	Prefix int `json:"prefix"`
+	// If empty, defaults to /32 for VIP (works across host/container subnets)
+	Prefix     int    `json:"prefix"`
+	Bridge     string `json:"bridge"`
+	BridgeCIDR string `json:"bridgeCIDR"`
+	BridgeIP   string `json:"bridgeIP"` // optional; else allocated from BridgeCIDR
 }
 
 func main() {
 	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.All, "routed-cni")
 }
 
-func cmdAdd(args *skel.CmdArgs) error {
+func parseConf(args *skel.CmdArgs) (*NetConf, error) {
 	conf := &NetConf{}
 	if err := json.Unmarshal(args.StdinData, conf); err != nil {
-		return err
+		return nil, err
 	}
-	if conf.ContainerIP == "" || conf.GWIP == "" {
-		// try CNI_ARGS (Nomad can pass containerIP=... here)
-		for _, kv := range strings.Split(args.Args, ";") {
-			if v, ok := strings.CutPrefix(kv, "containerIP="); ok && conf.ContainerIP == "" {
-				conf.ContainerIP = v
-			}
-			if v, ok := strings.CutPrefix(kv, "IP="); ok && conf.ContainerIP == "" {
-				conf.ContainerIP = v
-			}
+	for _, kv := range strings.Split(args.Args, ";") {
+		if v, ok := strings.CutPrefix(kv, "containerIP="); ok && conf.ContainerIP == "" {
+			conf.ContainerIP = v
 		}
+		if v, ok := strings.CutPrefix(kv, "IP="); ok && conf.ContainerIP == "" {
+			conf.ContainerIP = v
+		}
+		if v, ok := strings.CutPrefix(kv, "bridgeIP="); ok && conf.BridgeIP == "" {
+			conf.BridgeIP = v
+		}
+	}
+	if conf.Bridge == "" {
+		conf.Bridge = defaultBridge
+	}
+	if conf.BridgeCIDR == "" {
+		conf.BridgeCIDR = defaultBridgeCIDR
+	}
+	if conf.Prefix == 0 {
+		conf.Prefix = 32
+	}
+	return conf, nil
+}
+
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+func cmdAdd(args *skel.CmdArgs) error {
+	conf, err := parseConf(args)
+	if err != nil {
+		return err
 	}
 	if conf.ContainerIP == "" || conf.GWIP == "" {
 		return fmt.Errorf("containerIP and gwIP required")
 	}
 
-	id := args.ContainerID
-	if len(id) > 8 {
-		id = id[:8]
+	_, brNet, err := net.ParseCIDR(conf.BridgeCIDR)
+	if err != nil {
+		return fmt.Errorf("bridgeCIDR: %w", err)
 	}
-	hostName := "vethh-" + id
-	contName := "vethc-" + id
-
-	// create veth pair
-	veth := &netlink.Veth{
-		LinkAttrs: netlink.LinkAttrs{Name: hostName},
-		PeerName:  contName,
-	}
-	if err := netlink.LinkAdd(veth); err != nil {
-		return fmt.Errorf("link add: %w", err)
-	}
-
-	hostLink, err := netlink.LinkByName(hostName)
+	brGW := gatewayIP(brNet)
+	brLink, err := ensureBridge(conf.Bridge, brGW, brNet)
 	if err != nil {
 		return err
 	}
-	netlink.LinkSetUp(hostLink)
-	if err := netlink.LinkSetAlias(hostLink, "healthcheck:ok"); err != nil {
-		return fmt.Errorf("set alias: %w", err)
+
+	brIP := net.ParseIP(conf.BridgeIP)
+	if brIP == nil {
+		brIP, err = allocateBridgeIP(brNet, brGW, args.ContainerID)
+		if err != nil {
+			return err
+		}
+	} else {
+		if err := reserveBridgeIP(brIP, args.ContainerID); err != nil {
+			return err
+		}
 	}
 
-	// ensure sysctls (ip_forward once is enough; rp_filter=2 on veth for host IP reachability from container)
+	id := shortID(args.ContainerID)
+	vipHost, vipCont := "vethh-"+id, "vethc-"+id
+	brHost, brCont := "vethb-"+id, "vethd-"+id
+
+	if err := addVeth(vipHost, vipCont); err != nil {
+		return err
+	}
+	if err := addVeth(brHost, brCont); err != nil {
+		cleanupLink(vipHost)
+		return err
+	}
+
+	vipHostLink, err := netlink.LinkByName(vipHost)
+	if err != nil {
+		return err
+	}
+	brHostLink, err := netlink.LinkByName(brHost)
+	if err != nil {
+		return err
+	}
+	_ = netlink.LinkSetUp(vipHostLink)
+	_ = netlink.LinkSetUp(brHostLink)
+	_ = netlink.LinkSetAlias(vipHostLink, "healthcheck:ok")
+	if err := netlink.LinkSetMaster(brHostLink, brLink); err != nil {
+		return fmt.Errorf("set master: %w", err)
+	}
+
 	_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644)
-	_ = os.WriteFile(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", hostName), []byte("2\n"), 0644)
-	_ = os.WriteFile(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/proxy_arp", hostName), []byte("1\n"), 0644)
-
-	pfx := conf.Prefix
-	if pfx == 0 {
-		pfx = 32
+	for _, n := range []string{vipHost, brHost, conf.Bridge} {
+		_ = os.WriteFile(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", n), []byte("2\n"), 0644)
 	}
+	_ = os.WriteFile(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/proxy_arp", vipHost), []byte("1\n"), 0644)
 
-	// move cont end to netns
-	contLink, err := netlink.LinkByName(contName)
-	if err != nil {
-		return err
-	}
 	nsFile, err := os.Open(args.Netns)
 	if err != nil {
 		return err
 	}
 	defer nsFile.Close()
-	if err := netlink.LinkSetNsFd(contLink, int(nsFile.Fd())); err != nil {
-		return fmt.Errorf("set ns: %w", err)
+	for _, name := range []string{vipCont, brCont} {
+		l, err := netlink.LinkByName(name)
+		if err != nil {
+			return err
+		}
+		if err := netlink.LinkSetNsFd(l, int(nsFile.Fd())); err != nil {
+			return fmt.Errorf("set ns %s: %w", name, err)
+		}
 	}
 
-	// config inside container ns
-	contIPNet, err := netlink.ParseAddr(conf.ContainerIP + fmt.Sprintf("/%d", pfx))
+	vipAddr, err := netlink.ParseAddr(conf.ContainerIP + fmt.Sprintf("/%d", conf.Prefix))
 	if err != nil {
-		return fmt.Errorf("cont addr: %w", err)
+		return fmt.Errorf("vip addr: %w", err)
 	}
+	ones, _ := brNet.Mask.Size()
+	brAddr, err := netlink.ParseAddr(fmt.Sprintf("%s/%d", brIP, ones))
+	if err != nil {
+		return fmt.Errorf("bridge addr: %w", err)
+	}
+
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	origNs, err := netns.Get()
@@ -116,95 +180,128 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err := netns.Set(newNs); err != nil {
 		return err
 	}
-	l, err := netlink.LinkByName(contName)
-	if err != nil {
-		netns.Set(origNs)
-		return err
+	setupErr := func() error {
+		eth0, err := renameUp(vipCont, "eth0")
+		if err != nil {
+			return err
+		}
+		eth1, err := renameUp(brCont, "eth1")
+		if err != nil {
+			return err
+		}
+		if err := netlink.AddrAdd(eth0, vipAddr); err != nil {
+			return err
+		}
+		if err := netlink.AddrAdd(eth1, brAddr); err != nil {
+			return err
+		}
+		// local/default via bridge (Nomad-like)
+		if err := netlink.RouteReplace(&netlink.Route{
+			LinkIndex: eth1.Attrs().Index,
+			Gw:        brGW,
+		}); err != nil {
+			return fmt.Errorf("default via bridge: %w", err)
+		}
+		// VIP-sourced traffic still exits via host gw on eth0
+		rule := netlink.NewRule()
+		rule.Src = &net.IPNet{IP: net.ParseIP(conf.ContainerIP), Mask: net.CIDRMask(32, 32)}
+		rule.Table = vipTable
+		_ = netlink.RuleDel(rule) // idempotent replace
+		if err := netlink.RuleAdd(rule); err != nil {
+			return fmt.Errorf("vip rule: %w", err)
+		}
+		if err := netlink.RouteReplace(&netlink.Route{
+			Table:     vipTable,
+			LinkIndex: eth0.Attrs().Index,
+			Gw:        net.ParseIP(conf.GWIP),
+			Flags:     int(netlink.FLAG_ONLINK),
+		}); err != nil {
+			return fmt.Errorf("vip default: %w", err)
+		}
+		return nil
+	}()
+	_ = netns.Set(origNs)
+	if setupErr != nil {
+		return setupErr
 	}
-	// Once in the namespace, we can do things like set the network name to eth0
-	if err := netlink.LinkSetName(l, "eth0"); err != nil {
-		netns.Set(origNs)
-		return err
-	}
-	if err := netlink.LinkSetUp(l); err != nil {
-		netns.Set(origNs)
-		return err
-	}
-	if err := netlink.AddrAdd(l, contIPNet); err != nil {
-		netns.Set(origNs)
-		return err
-	}
-	rt := &netlink.Route{
-		LinkIndex: l.Attrs().Index,
-		Gw:        net.ParseIP(conf.GWIP),
-		Flags:     int(netlink.FLAG_ONLINK),
-	}
-	if err := netlink.RouteReplace(rt); err != nil {
-		netns.Set(origNs)
-		return err
-	}
-	netns.Set(origNs)
 
-	// ensure host route for container IP (via host veth) so router-delivered packets reach the ns
-	hostRt := &netlink.Route{
-		LinkIndex: hostLink.Attrs().Index,
-		Dst:       &net.IPNet{IP: net.ParseIP(conf.ContainerIP), Mask: net.CIDRMask(pfx, pfx)},
-	}
-	if err := netlink.RouteReplace(hostRt); err != nil {
-		return fmt.Errorf("host route: %w", err)
+	if err := netlink.RouteReplace(&netlink.Route{
+		LinkIndex: vipHostLink.Attrs().Index,
+		Dst:       &net.IPNet{IP: net.ParseIP(conf.ContainerIP), Mask: net.CIDRMask(conf.Prefix, conf.Prefix)},
+	}); err != nil {
+		return fmt.Errorf("host vip route: %w", err)
 	}
 	if err := setupForward(conf.ContainerIP); err != nil {
-		return fmt.Errorf("forward rules: %w", err)
+		return fmt.Errorf("vip forward: %w", err)
+	}
+	if err := setupForward(brIP.String()); err != nil {
+		return fmt.Errorf("bridge forward: %w", err)
+	}
+	if err := ensureMasq(conf.BridgeCIDR, conf.Bridge); err != nil {
+		return fmt.Errorf("masq: %w", err)
 	}
 
-	idx := 0
+	eth0idx, eth1idx := 0, 1
 	res := &current.Result{
 		CNIVersion: conf.CNIVersion,
 		Interfaces: []*current.Interface{
 			{Name: "eth0", Sandbox: args.Netns},
+			{Name: "eth1", Sandbox: args.Netns},
 		},
 		IPs: []*current.IPConfig{
-			{Address: *contIPNet.IPNet, Interface: &idx},
+			{Address: *vipAddr.IPNet, Interface: &eth0idx},
+			{Address: *brAddr.IPNet, Interface: &eth1idx},
 		},
 	}
 	return types.PrintResult(res, conf.CNIVersion)
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	conf := &NetConf{}
-	json.Unmarshal(args.StdinData, conf)
-	if conf.ContainerIP == "" {
-		for _, kv := range strings.Split(args.Args, ";") {
-			if v, ok := strings.CutPrefix(kv, "containerIP="); ok {
-				conf.ContainerIP = v
-			}
-			if v, ok := strings.CutPrefix(kv, "IP="); ok {
-				conf.ContainerIP = v
-			}
+	conf, _ := parseConf(args)
+	id := shortID(args.ContainerID)
+
+	brIP := ""
+	if conf != nil && conf.BridgeIP != "" {
+		brIP = conf.BridgeIP
+	}
+	if brIP == "" {
+		brIP = lookupBridgeIP(args.ContainerID)
+	}
+
+	if conf != nil && conf.ContainerIP != "" {
+		// best-effort: clear vip policy in netns if still present
+		if args.Netns != "" {
+			_ = withNetns(args.Netns, func() error {
+				rule := netlink.NewRule()
+				rule.Src = &net.IPNet{IP: net.ParseIP(conf.ContainerIP), Mask: net.CIDRMask(32, 32)}
+				rule.Table = vipTable
+				_ = netlink.RuleDel(rule)
+				_ = netlink.RouteDel(&netlink.Route{Table: vipTable, Dst: nil})
+				return nil
+			})
 		}
-	}
-	pfx := conf.Prefix
-	if pfx == 0 {
-		pfx = 32
-	}
-	id := args.ContainerID
-	if len(id) > 8 {
-		id = id[:8]
-	}
-	hostName := "vethh-" + id
-	hostLink, err := netlink.LinkByName(hostName)
-	if err == nil {
-		if conf.ContainerIP != "" {
-			hostRt := &netlink.Route{
+		if hostLink, err := netlink.LinkByName("vethh-" + id); err == nil {
+			pfx := 32
+			if conf.Prefix != 0 {
+				pfx = conf.Prefix
+			}
+			_ = netlink.RouteDel(&netlink.Route{
 				LinkIndex: hostLink.Attrs().Index,
 				Dst:       &net.IPNet{IP: net.ParseIP(conf.ContainerIP), Mask: net.CIDRMask(pfx, pfx)},
-			}
-			netlink.RouteDel(hostRt)
-			teardownForward(conf.ContainerIP)
+			})
+			_ = netlink.LinkDel(hostLink)
 		}
-		netlink.LinkDel(hostLink)
-	} else if conf.ContainerIP != "" {
 		teardownForward(conf.ContainerIP)
+	} else if hostLink, err := netlink.LinkByName("vethh-" + id); err == nil {
+		_ = netlink.LinkDel(hostLink)
+	}
+
+	if brHost, err := netlink.LinkByName("vethb-" + id); err == nil {
+		_ = netlink.LinkDel(brHost)
+	}
+	if brIP != "" {
+		teardownForward(brIP)
+		releaseBridgeIP(brIP, args.ContainerID)
 	}
 	return nil
 }
@@ -213,7 +310,229 @@ func cmdCheck(args *skel.CmdArgs) error {
 	return nil
 }
 
-// full allow: routed /32 has no bridge iface for NOMAD-ADMIN-style -o matching
+func addVeth(hostName, peerName string) error {
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: hostName},
+		PeerName:  peerName,
+	}
+	if err := netlink.LinkAdd(veth); err != nil {
+		return fmt.Errorf("link add %s: %w", hostName, err)
+	}
+	return nil
+}
+
+func cleanupLink(name string) {
+	if l, err := netlink.LinkByName(name); err == nil {
+		_ = netlink.LinkDel(l)
+	}
+}
+
+func renameUp(from, to string) (netlink.Link, error) {
+	l, err := netlink.LinkByName(from)
+	if err != nil {
+		return nil, err
+	}
+	if err := netlink.LinkSetName(l, to); err != nil {
+		return nil, err
+	}
+	l, err = netlink.LinkByName(to)
+	if err != nil {
+		return nil, err
+	}
+	if err := netlink.LinkSetUp(l); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+func ensureBridge(name string, gw net.IP, subnet *net.IPNet) (netlink.Link, error) {
+	l, err := netlink.LinkByName(name)
+	if err != nil {
+		br := &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: name}}
+		if err := netlink.LinkAdd(br); err != nil {
+			return nil, fmt.Errorf("bridge add: %w", err)
+		}
+		l, err = netlink.LinkByName(name)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := netlink.LinkSetUp(l); err != nil {
+		return nil, err
+	}
+	ones, _ := subnet.Mask.Size()
+	addr, err := netlink.ParseAddr(fmt.Sprintf("%s/%d", gw, ones))
+	if err != nil {
+		return nil, err
+	}
+	addrs, _ := netlink.AddrList(l, netlink.FAMILY_V4)
+	have := false
+	for _, a := range addrs {
+		if a.IP.Equal(gw) {
+			have = true
+			break
+		}
+	}
+	if !have {
+		if err := netlink.AddrAdd(l, addr); err != nil {
+			return nil, fmt.Errorf("bridge addr: %w", err)
+		}
+	}
+	return l, nil
+}
+
+func gatewayIP(subnet *net.IPNet) net.IP {
+	ip := append(net.IP(nil), subnet.IP.To4()...)
+	ip[3]++
+	return ip
+}
+
+func nextIP(ip net.IP) net.IP {
+	ip = append(net.IP(nil), ip.To4()...)
+	for i := 3; i >= 0; i-- {
+		ip[i]++
+		if ip[i] != 0 {
+			break
+		}
+	}
+	return ip
+}
+
+func lastIP(subnet *net.IPNet) net.IP {
+	ip := append(net.IP(nil), subnet.IP.To4()...)
+	for i, b := range []byte(subnet.Mask) {
+		ip[i] |= ^b
+	}
+	return ip
+}
+
+func allocateBridgeIP(subnet *net.IPNet, gateway net.IP, id string) (net.IP, error) {
+	if err := os.MkdirAll(filepath.Join(dataDir, "ips"), 0755); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "by-id"), 0755); err != nil {
+		return nil, err
+	}
+	unlock, err := flock(filepath.Join(dataDir, "lock"))
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	if existing := lookupBridgeIPLocked(id); existing != nil {
+		return existing, nil
+	}
+
+	broadcast := lastIP(subnet)
+	for ip := nextIP(subnet.IP); subnet.Contains(ip); ip = nextIP(ip) {
+		if ip.Equal(gateway) || ip.Equal(broadcast) {
+			continue
+		}
+		path := filepath.Join(dataDir, "ips", ip.String())
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if err != nil {
+			continue
+		}
+		_, _ = f.WriteString(id)
+		f.Close()
+		_ = os.WriteFile(filepath.Join(dataDir, "by-id", id), []byte(ip.String()), 0644)
+		return ip, nil
+	}
+	return nil, fmt.Errorf("bridge subnet exhausted")
+}
+
+func reserveBridgeIP(ip net.IP, id string) error {
+	if err := os.MkdirAll(filepath.Join(dataDir, "ips"), 0755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "by-id"), 0755); err != nil {
+		return err
+	}
+	unlock, err := flock(filepath.Join(dataDir, "lock"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	path := filepath.Join(dataDir, "ips", ip.String())
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("bridgeIP %s in use: %w", ip, err)
+	}
+	_, _ = f.WriteString(id)
+	f.Close()
+	return os.WriteFile(filepath.Join(dataDir, "by-id", id), []byte(ip.String()), 0644)
+}
+
+func releaseBridgeIP(ip, id string) {
+	unlock, err := flock(filepath.Join(dataDir, "lock"))
+	if err != nil {
+		return
+	}
+	defer unlock()
+	_ = os.Remove(filepath.Join(dataDir, "ips", ip))
+	_ = os.Remove(filepath.Join(dataDir, "by-id", id))
+}
+
+func lookupBridgeIP(id string) string {
+	unlock, err := flock(filepath.Join(dataDir, "lock"))
+	if err != nil {
+		b, _ := os.ReadFile(filepath.Join(dataDir, "by-id", id))
+		return strings.TrimSpace(string(b))
+	}
+	defer unlock()
+	ip := lookupBridgeIPLocked(id)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+func lookupBridgeIPLocked(id string) net.IP {
+	b, err := os.ReadFile(filepath.Join(dataDir, "by-id", id))
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(strings.TrimSpace(string(b)))
+}
+
+func flock(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
+}
+
+func withNetns(path string, fn func() error) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	orig, err := netns.Get()
+	if err != nil {
+		return err
+	}
+	defer orig.Close()
+	ns, err := netns.GetFromPath(path)
+	if err != nil {
+		return err
+	}
+	defer ns.Close()
+	if err := netns.Set(ns); err != nil {
+		return err
+	}
+	defer netns.Set(orig)
+	return fn()
+}
+
 func forwardRules(ip string) [][]string {
 	cidr := ip + "/32"
 	return [][]string{
@@ -267,4 +586,13 @@ func ensureCNIForward(ipt *iptables.IPTables) error {
 		return ipt.Insert("filter", "FORWARD", 1, jump...)
 	}
 	return nil
+}
+
+func ensureMasq(cidr, bridge string) error {
+	ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	if err != nil {
+		return err
+	}
+	args := []string{"-s", cidr, "!", "-o", bridge, "-j", "MASQUERADE"}
+	return ipt.AppendUnique("nat", "POSTROUTING", args...)
 }

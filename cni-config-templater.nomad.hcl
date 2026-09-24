@@ -27,7 +27,9 @@ job "cni-config-templater" {
     {
       "type": "routed-cni",
       "gwIP": "{{ $hostIP }}",
-      "prefix": 32
+      "prefix": 32,
+      "bridge": "routedbr",
+      "bridgeCIDR": "172.27.64.0/20"
     }
   ]
 }

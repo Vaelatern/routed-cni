@@ -5,7 +5,9 @@
     {
       "type": "routed-cni",
       "gwIP": "10.0.10.10",
-      "prefix": 32
+      "prefix": 32,
+      "bridge": "routedbr",
+      "bridgeCIDR": "172.27.64.0/20"
     }
   ]
 }
